@@ -1,0 +1,17 @@
+{
+  "name": "xiaozhi-private-backend-shim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal local OTA + WebSocket shim for ESP32 robot dog private backend bring-up",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "openai": "^4.104.0",
+    "opusscript": "^0.1.1",
+    "ws": "^8.18.0"
+  }
+}
