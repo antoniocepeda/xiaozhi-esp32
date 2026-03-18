@@ -4,6 +4,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import OpenAI from 'openai';
 import OpusScript from 'opusscript';
+import { spawnSync } from 'node:child_process';
 
 const PORT = Number(process.env.PORT || 8788);
 const WS_PATH = process.env.WS_PATH || '/ws';
@@ -18,9 +19,14 @@ const AUTO_FINALIZE_MS = Number(process.env.AUTO_FINALIZE_MS || 900);
 const HARD_FINALIZE_MS = Number(process.env.HARD_FINALIZE_MS || 4000);
 const MIN_PACKETS_BEFORE_FINALIZE = Number(process.env.MIN_PACKETS_BEFORE_FINALIZE || 8);
 const OPENAI_TTS_PCM_RATE = Number(process.env.OPENAI_TTS_PCM_RATE || 24000);
-const SERVER_SAMPLE_RATE = 16000;
-const SERVER_FRAME_DURATION_MS = 60;
-const SERVER_FRAME_SAMPLES = (SERVER_SAMPLE_RATE * SERVER_FRAME_DURATION_MS) / 1000; // 960
+const SERVER_SAMPLE_RATE = Number(process.env.SERVER_SAMPLE_RATE || 16000);
+const SERVER_FRAME_DURATION_MS = Number(process.env.SERVER_FRAME_DURATION_MS || 60);
+const SERVER_FRAME_SAMPLES = (SERVER_SAMPLE_RATE * SERVER_FRAME_DURATION_MS) / 1000; // 960 @16k/60ms
+const TTS_TEST_MODE = (process.env.TTS_TEST_MODE || 'normal').toLowerCase(); // normal | silence | tone | loopback
+const TTS_TEST_TONE_HZ = Number(process.env.TTS_TEST_TONE_HZ || 440);
+const TTS_TEST_TONE_MS = Number(process.env.TTS_TEST_TONE_MS || 1500);
+const TTS_TEST_SILENCE_MS = Number(process.env.TTS_TEST_SILENCE_MS || 2000);
+const AUDIO_DEBUG = (process.env.AUDIO_DEBUG || 'true').toLowerCase() === 'true';
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -128,7 +134,42 @@ function resamplePcm16Mono(inputPcm, inRate, outRate) {
   return Buffer.from(outSamples.buffer, outSamples.byteOffset, outSamples.byteLength);
 }
 
+function pcmDurationMs(pcmBuffer) {
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  return Math.round((sampleCount * 1000) / SERVER_SAMPLE_RATE);
+}
+
+function generateSilencePcm16(durationMs) {
+  const sampleCount = Math.max(1, Math.floor((SERVER_SAMPLE_RATE * durationMs) / 1000));
+  return Buffer.alloc(sampleCount * 2);
+}
+
+function generateTonePcm16(durationMs, frequencyHz) {
+  const sampleCount = Math.max(1, Math.floor((SERVER_SAMPLE_RATE * durationMs) / 1000));
+  const samples = new Int16Array(sampleCount);
+  const amplitude = 0.25 * 32767;
+  const phaseStep = (2 * Math.PI * frequencyHz) / SERVER_SAMPLE_RATE;
+
+  for (let i = 0; i < sampleCount; i++) {
+    samples[i] = Math.round(amplitude * Math.sin(i * phaseStep));
+  }
+
+  return Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+}
+
 async function synthesizeTtsPcm16(text) {
+  if (TTS_TEST_MODE === 'silence') {
+    const pcm = generateSilencePcm16(TTS_TEST_SILENCE_MS);
+    console.log(`[${now()}] TTS_TEST_MODE=silence -> ${pcmDurationMs(pcm)}ms (${pcm.length} bytes)`);
+    return pcm;
+  }
+
+  if (TTS_TEST_MODE === 'tone') {
+    const pcm = generateTonePcm16(TTS_TEST_TONE_MS, TTS_TEST_TONE_HZ);
+    console.log(`[${now()}] TTS_TEST_MODE=tone(${TTS_TEST_TONE_HZ}Hz) -> ${pcmDurationMs(pcm)}ms (${pcm.length} bytes)`);
+    return pcm;
+  }
+
   if (!openai) throw new Error('OPENAI_API_KEY missing');
 
   const ttsResp = await openai.audio.speech.create({
@@ -144,9 +185,131 @@ async function synthesizeTtsPcm16(text) {
   return resampled;
 }
 
+function extractOpusPacketsFromOgg(oggBuffer) {
+  const packets = [];
+  let off = 0;
+  let packetParts = [];
+
+  while (off + 27 <= oggBuffer.length) {
+    if (oggBuffer.toString('ascii', off, off + 4) !== 'OggS') break;
+
+    const pageSegments = oggBuffer[off + 26];
+    const segTableOff = off + 27;
+    const payloadOff = segTableOff + pageSegments;
+    if (payloadOff > oggBuffer.length) break;
+
+    const segTable = oggBuffer.subarray(segTableOff, segTableOff + pageSegments);
+    let payloadPtr = payloadOff;
+
+    for (const segLen of segTable) {
+      if (payloadPtr + segLen > oggBuffer.length) break;
+      packetParts.push(oggBuffer.subarray(payloadPtr, payloadPtr + segLen));
+      payloadPtr += segLen;
+
+      if (segLen < 255) {
+        const pkt = Buffer.concat(packetParts);
+        packetParts = [];
+        if (pkt.length >= 8) {
+          const sig = pkt.subarray(0, 8).toString('ascii');
+          if (sig !== 'OpusHead' && sig !== 'OpusTags') packets.push(pkt);
+        } else if (pkt.length > 0) {
+          packets.push(pkt);
+        }
+      }
+    }
+
+    off = payloadPtr;
+  }
+
+  return packets;
+}
+
+function encodePcmToOpusPacketsViaFfmpeg(pcmBuffer, sampleRate) {
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-f',
+    's16le',
+    '-ar',
+    String(sampleRate),
+    '-ac',
+    '1',
+    '-i',
+    'pipe:0',
+    '-c:a',
+    'libopus',
+    '-application',
+    'audio',
+    '-frame_duration',
+    String(SERVER_FRAME_DURATION_MS),
+    '-vbr',
+    'off',
+    '-b:a',
+    '32k',
+    '-f',
+    'ogg',
+    'pipe:1',
+  ];
+
+  const out = spawnSync('ffmpeg', args, {
+    input: pcmBuffer,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+
+  if (out.status !== 0) {
+    const err = out.stderr?.toString('utf8') || `ffmpeg failed with code ${out.status}`;
+    throw new Error(err.trim());
+  }
+
+  const ogg = out.stdout;
+  const packets = extractOpusPacketsFromOgg(ogg);
+  if (!packets.length) throw new Error('No Opus packets extracted from ffmpeg output');
+
+  if (AUDIO_DEBUG) {
+    console.log(`[${now()}] ffmpeg opus packets=${packets.length}, oggBytes=${ogg.length}`);
+  }
+
+  return packets;
+}
+
+async function streamLoopbackOpusV3(ws, opusFrames) {
+  if (!opusFrames?.length) {
+    console.log(`[${now()}] loopback: no captured opus frames`);
+    return;
+  }
+
+  console.log(
+    `[${now()}] loopback out: frames=${opusFrames.length}, frameMs=${SERVER_FRAME_DURATION_MS}`,
+  );
+
+  for (let i = 0; i < opusFrames.length; i++) {
+    if (ws.readyState !== ws.OPEN) break;
+    const opus = opusFrames[i];
+    const packet = buildBinaryProtocolV3(opus);
+    ws.send(packet, { binary: true });
+
+    if (AUDIO_DEBUG && (i < 5 || i % 25 === 0 || i === opusFrames.length - 1)) {
+      console.log(
+        `[${now()}] loopback frame out seq=${i + 1}/${opusFrames.length} opusBytes=${opus.length} packetBytes=${packet.length}`,
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, SERVER_FRAME_DURATION_MS));
+  }
+}
+
 async function streamPcmAsOpusV3(ws, pcmBuffer) {
   const encoder = new OpusScript(SERVER_SAMPLE_RATE, 1, OpusScript.Application.AUDIO);
   const frameBytes = SERVER_FRAME_SAMPLES * 2; // s16le mono
+  const totalFrames = Math.ceil(pcmBuffer.length / frameBytes);
+  let sentFrames = 0;
+
+  if (AUDIO_DEBUG) {
+    console.log(
+      `[${now()}] audio out config: mode=${TTS_TEST_MODE}, sampleRate=${SERVER_SAMPLE_RATE}, channels=1, frameMs=${SERVER_FRAME_DURATION_MS}, frameSamples=${SERVER_FRAME_SAMPLES}, frameBytes=${frameBytes}, totalPcmBytes=${pcmBuffer.length}, totalFrames=${totalFrames}`,
+    );
+  }
 
   for (let off = 0; off < pcmBuffer.length; off += frameBytes) {
     if (ws.readyState !== ws.OPEN) break;
@@ -163,6 +326,14 @@ async function streamPcmAsOpusV3(ws, pcmBuffer) {
     const opus = Buffer.from(encoder.encode(pcm16, SERVER_FRAME_SAMPLES));
     const packet = buildBinaryProtocolV3(opus);
     ws.send(packet, { binary: true });
+
+    sentFrames += 1;
+    if (AUDIO_DEBUG && (sentFrames <= 5 || sentFrames % 25 === 0 || sentFrames === totalFrames)) {
+      const ts = Date.now();
+      console.log(
+        `[${now()}] audio frame out seq=${sentFrames}/${totalFrames} tsMs=${ts} pcmBytes=${chunk.length} opusBytes=${opus.length} packetBytes=${packet.length}`,
+      );
+    }
 
     await new Promise((r) => setTimeout(r, SERVER_FRAME_DURATION_MS));
   }
@@ -221,6 +392,7 @@ wss.on('connection', (ws, req) => {
   let binaryPackets = 0;
   const decoder = new OpusScript(SERVER_SAMPLE_RATE, 1, OpusScript.Application.AUDIO);
   const pcmChunks = [];
+  const loopbackOpusFrames = [];
 
   const clearSilenceTimer = () => {
     if (silenceTimer) {
@@ -247,7 +419,7 @@ wss.on('connection', (ws, req) => {
     try {
       const pcm = Buffer.concat(pcmChunks);
       pcmChunks.length = 0;
-      console.log(`[${now()}] finalize turn (${reason}), packets=${binaryPackets}, pcmBytes=${pcm.length}`);
+      console.log(`[${now()}] finalize turn (${reason}), packets=${binaryPackets}, pcmBytes=${pcm.length}, loopbackFrames=${loopbackOpusFrames.length}`);
 
       const userText = await transcribePcmToText(pcm);
       console.log(`[${now()}] STT: ${userText || '<empty>'}`);
@@ -266,9 +438,14 @@ wss.on('connection', (ws, req) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts', state: 'sentence_start', text: replyText }));
 
       if (ENABLE_TTS_AUDIO) {
-        const ttsPcm = await synthesizeTtsPcm16(replyText);
-        console.log(`[${now()}] TTS pcm bytes=${ttsPcm.length} @${SERVER_SAMPLE_RATE}Hz`);
-        await streamPcmAsOpusV3(ws, ttsPcm);
+        if (TTS_TEST_MODE === 'loopback') {
+          await streamLoopbackOpusV3(ws, loopbackOpusFrames);
+        } else {
+          const ttsPcm = await synthesizeTtsPcm16(replyText);
+          console.log(`[${now()}] TTS pcm bytes=${ttsPcm.length} @${SERVER_SAMPLE_RATE}Hz`);
+          const opusPackets = encodePcmToOpusPacketsViaFfmpeg(ttsPcm, SERVER_SAMPLE_RATE);
+          await streamLoopbackOpusV3(ws, opusPackets);
+        }
       }
 
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts', state: 'stop' }));
@@ -283,6 +460,7 @@ wss.on('connection', (ws, req) => {
     } finally {
       turnInFlight = false;
       binaryPackets = 0;
+      loopbackOpusFrames.length = 0;
     }
   };
 
@@ -291,6 +469,7 @@ wss.on('connection', (ws, req) => {
       if (!listeningActive) return;
       try {
         const opusPayload = unwrapIncomingOpusFrame(data);
+        loopbackOpusFrames.push(Buffer.from(opusPayload));
         const pcm16 = decoder.decode(opusPayload, SERVER_FRAME_SAMPLES);
         const pcmBuf = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
         pcmChunks.push(Buffer.from(pcmBuf));
@@ -344,6 +523,7 @@ wss.on('connection', (ws, req) => {
     if (msg?.type === 'listen' && msg?.state === 'start') {
       listeningActive = true;
       pcmChunks.length = 0;
+      loopbackOpusFrames.length = 0;
       binaryPackets = 0;
       clearSilenceTimer();
       clearHardTimer();
@@ -378,4 +558,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`OTA: http://0.0.0.0:${PORT}/ota/`);
   console.log(`WS : ws://0.0.0.0:${PORT}${WS_PATH}`);
   console.log(`PUBLIC_HOST for device OTA response: ${PUBLIC_HOST}`);
+  console.log(`Audio config: sampleRate=${SERVER_SAMPLE_RATE}, frameMs=${SERVER_FRAME_DURATION_MS}, testMode=${TTS_TEST_MODE}, debug=${AUDIO_DEBUG}`);
 });
