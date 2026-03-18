@@ -39,6 +39,81 @@ function now() {
   return new Date().toISOString();
 }
 
+let mcpRequestId = 1000;
+
+function nextMcpId() {
+  mcpRequestId += 1;
+  return mcpRequestId;
+}
+
+function maybeBuildDogActionFromText(userText) {
+  const t = (userText || '').toLowerCase();
+  if (!t) return null;
+
+  if (/(stop|halt|freeze|be still|stand still|calm down)/.test(t)) {
+    return { tool: 'self.dog.basic_control', args: { action: 'stop' }, spoken: 'Stopping now.' };
+  }
+
+  if (/(dance|boogie|party|show me a move|do a move)/.test(t)) {
+    return {
+      sequence: [
+        { tool: 'self.dog.advanced_control', args: { action: 'sway' } },
+        { tool: 'self.dog.advanced_control', args: { action: 'shake_hand' } },
+        { tool: 'self.dog.advanced_control', args: { action: 'sway_back_forth' } },
+      ],
+      spoken: 'Dance mode activated.',
+    };
+  }
+
+  if (/(jump|hop)/.test(t)) {
+    return { tool: 'self.dog.advanced_control', args: { action: 'jump_forward' }, spoken: 'Jumping.' };
+  }
+
+  if (/(shake hand|paw)/.test(t)) {
+    return { tool: 'self.dog.advanced_control', args: { action: 'shake_hand' }, spoken: 'Offering a paw.' };
+  }
+
+  if (/(lay down|lie down)/.test(t)) {
+    return { tool: 'self.dog.advanced_control', args: { action: 'lay_down' }, spoken: 'Laying down.' };
+  }
+
+  if (/(forward|go ahead|move ahead)/.test(t)) {
+    return { tool: 'self.dog.basic_control', args: { action: 'forward' }, spoken: 'Moving forward.' };
+  }
+
+  if (/(backward|go back|reverse)/.test(t)) {
+    return { tool: 'self.dog.basic_control', args: { action: 'backward' }, spoken: 'Reversing.' };
+  }
+
+  if (/(turn left)/.test(t)) {
+    return { tool: 'self.dog.basic_control', args: { action: 'turn_left' }, spoken: 'Turning left.' };
+  }
+
+  if (/(turn right)/.test(t)) {
+    return { tool: 'self.dog.basic_control', args: { action: 'turn_right' }, spoken: 'Turning right.' };
+  }
+
+  return null;
+}
+
+function sendMcpToolCall(ws, toolName, args = {}) {
+  if (ws.readyState !== ws.OPEN) return false;
+
+  const payload = {
+    jsonrpc: '2.0',
+    id: nextMcpId(),
+    method: 'tools/call',
+    params: {
+      name: toolName,
+      arguments: args,
+    },
+  };
+
+  ws.send(JSON.stringify({ type: 'mcp', payload }));
+  console.log(`[${now()}] MCP tools/call -> ${toolName} ${JSON.stringify(args)}`);
+  return true;
+}
+
 async function generateAssistantReply({ deviceId, clientId, userText }) {
   if (!openai) return 'OpenAI API key missing on backend.';
 
@@ -428,11 +503,26 @@ wss.on('connection', (ws, req) => {
       }
 
       const promptText = userText || 'The user spoke but transcription was empty. Ask them to repeat briefly.';
-      const replyText = await generateAssistantReply({
-        deviceId: String(deviceId),
-        clientId: String(clientId),
-        userText: promptText,
-      });
+
+      let replyText = '';
+      const dogAction = maybeBuildDogActionFromText(promptText);
+      if (dogAction) {
+        if (dogAction.sequence) {
+          for (const step of dogAction.sequence) {
+            sendMcpToolCall(ws, step.tool, step.args || {});
+            await new Promise((r) => setTimeout(r, 150));
+          }
+        } else {
+          sendMcpToolCall(ws, dogAction.tool, dogAction.args || {});
+        }
+        replyText = dogAction.spoken || 'Done.';
+      } else {
+        replyText = await generateAssistantReply({
+          deviceId: String(deviceId),
+          clientId: String(clientId),
+          userText: promptText,
+        });
+      }
 
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts', state: 'start' }));
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tts', state: 'sentence_start', text: replyText }));
