@@ -27,6 +27,22 @@ Default bind:
 - OTA: `http://0.0.0.0:8788/ota/`
 - WS: `ws://0.0.0.0:8788/ws`
 
+## Local env notes
+
+Keep local secrets and machine-specific config in `tools/private-backend-shim/.env`.
+That file is intentionally gitignored.
+
+For actual spoken voice output from the dog, set:
+
+```env
+ENABLE_TTS_AUDIO=true
+TTS_TEST_MODE=normal
+```
+
+Useful test modes:
+- `TTS_TEST_MODE=tone` → confirms speaker/audio path without using OpenAI TTS
+- `TTS_TEST_MODE=normal` → uses OpenAI TTS for real voice replies
+
 ## Device-side expectation
 
 This patch set sets firmware default OTA URL to:

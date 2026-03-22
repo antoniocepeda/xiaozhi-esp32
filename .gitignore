@@ -21,3 +21,4 @@ mmap_generate_*.h
 
 # local backend shim deps
 tools/private-backend-shim/node_modules/
+tools/private-backend-shim/.env
