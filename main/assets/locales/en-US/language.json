@@ -25,6 +25,8 @@
         "CONNECTING": "Connecting...",
         "CONNECTION_SUCCESSFUL": "Connection Successful",
         "CONNECTED_TO": "Connected to ",
+        "NEXT_STEP": "Next: open mojbot.com/start",
+        "ENTER_CODE_AND_NAME": "Then enter your code and your kid's name.",
         "LISTENING": "Listening...",
         "SPEAKING": "Speaking...",
         "SERVER_NOT_FOUND": "Looking for available service",

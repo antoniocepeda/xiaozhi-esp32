@@ -9,8 +9,12 @@
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
+    esp_timer_handle_t config_prompt_timer_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
+
+    void ShowWifiConfigPrompt();
+    static void OnWifiConfigPromptTimer(void* arg);
 
     virtual std::string GetBoardJson() override;
 

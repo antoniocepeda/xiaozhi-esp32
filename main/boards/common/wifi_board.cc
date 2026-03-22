@@ -28,20 +28,33 @@ static constexpr int CONNECT_TIMEOUT_SEC = 60;
 
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
-    esp_timer_create_args_t timer_args = {
+    esp_timer_create_args_t connect_timer_args = {
         .callback = OnWifiConnectTimeout,
         .arg = this,
         .dispatch_method = ESP_TIMER_TASK,
         .name = "wifi_connect_timer",
         .skip_unhandled_events = true
     };
-    esp_timer_create(&timer_args, &connect_timer_);
+    esp_timer_create(&connect_timer_args, &connect_timer_);
+
+    esp_timer_create_args_t config_prompt_timer_args = {
+        .callback = OnWifiConfigPromptTimer,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wifi_config_prompt_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&config_prompt_timer_args, &config_prompt_timer_);
 }
 
 WifiBoard::~WifiBoard() {
     if (connect_timer_) {
         esp_timer_stop(connect_timer_);
         esp_timer_delete(connect_timer_);
+    }
+    if (config_prompt_timer_) {
+        esp_timer_stop(config_prompt_timer_);
+        esp_timer_delete(config_prompt_timer_);
     }
 }
 
@@ -54,7 +67,7 @@ void WifiBoard::StartNetwork() {
 
     // Initialize WiFi manager
     WifiManagerConfig config;
-    config.ssid_prefix = "Xiaozhi";
+    config.ssid_prefix = "MojBot";
     config.language = Lang::CODE;
     wifi_manager.Initialize(config);
 
@@ -108,6 +121,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::Connected:
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
+            if (config_prompt_timer_) {
+                esp_timer_stop(config_prompt_timer_);
+            }
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
@@ -131,6 +147,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
+            if (config_prompt_timer_) {
+                esp_timer_stop(config_prompt_timer_);
+            }
             // Try to connect with the new credentials
             TryWifiConnect();
             break;
@@ -156,6 +175,34 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
     board->StartWifiConfigMode();
 }
 
+void WifiBoard::ShowWifiConfigPrompt() {
+#ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
+    auto& wifi_manager = WifiManager::GetInstance();
+    std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
+    hint += wifi_manager.GetApSsid();
+    hint += Lang::Strings::ACCESS_VIA_BROWSER;
+    hint += wifi_manager.GetApWebUrl();
+
+    Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
+#endif
+}
+
+void WifiBoard::OnWifiConfigPromptTimer(void* arg) {
+    auto* board = static_cast<WifiBoard*>(arg);
+    if (!board->in_config_mode_ || !WifiManager::GetInstance().IsConfigMode()) {
+        if (board->config_prompt_timer_) {
+            esp_timer_stop(board->config_prompt_timer_);
+        }
+        return;
+    }
+
+    Application::GetInstance().Schedule([board]() {
+        if (board->in_config_mode_ && WifiManager::GetInstance().IsConfigMode()) {
+            board->ShowWifiConfigPrompt();
+        }
+    });
+}
+
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
     // Transition to wifi configuring state
@@ -166,14 +213,13 @@ void WifiBoard::StartWifiConfigMode() {
     wifi_manager.StartConfigAp();
 
     // Show config prompt after a short delay
-    Application::GetInstance().Schedule([&wifi_manager]() {
-        std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
-        hint += wifi_manager.GetApSsid();
-        hint += Lang::Strings::ACCESS_VIA_BROWSER;
-        hint += wifi_manager.GetApWebUrl();
-
-        Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
+    Application::GetInstance().Schedule([this]() {
+        ShowWifiConfigPrompt();
     });
+    if (config_prompt_timer_) {
+        esp_timer_stop(config_prompt_timer_);
+        esp_timer_start_periodic(config_prompt_timer_, 12 * 1000000ULL);
+    }
 #elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
     auto &blufi = Blufi::GetInstance();
     // initialize esp-blufi protocol

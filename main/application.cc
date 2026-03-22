@@ -125,6 +125,12 @@ void Application::Initialize() {
                 msg += data;
                 display->ShowNotification(msg.c_str(), 30000);
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
+
+                display->ShowNotification(Lang::Strings::NEXT_STEP, 30000);
+                Schedule([this, display]() {
+                    Alert(Lang::Strings::INFO, Lang::Strings::NEXT_STEP, "globe", Lang::Sounds::OGG_WELCOME);
+                    display->ShowNotification(Lang::Strings::ENTER_CODE_AND_NAME, 30000);
+                });
                 break;
             }
             case NetworkEvent::Disconnected:
