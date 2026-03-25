@@ -11,6 +11,7 @@ const WS_PATH = process.env.WS_PATH || '/ws';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '192.168.1.50';
 const WS_PROTOCOL_VERSION = Number(process.env.WS_PROTOCOL_VERSION || 3);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const ROBOT_CONFIG_URL = process.env.ROBOT_CONFIG_URL || 'https://robotconfig-ndtagy32va-uc.a.run.app';
 const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts';
 const OPENAI_TTS_VOICE = process.env.OPENAI_TTS_VOICE || 'alloy';
 const OPENAI_STT_MODEL = process.env.OPENAI_STT_MODEL || 'gpt-4o-mini-transcribe';
@@ -433,6 +434,68 @@ function otaPayload(req) {
     }
   };
 }
+
+function defaultRobotConfig() {
+  return {
+    ok: true,
+    config: {
+      configVersion: 0,
+      updatedAt: null,
+      kidName: null,
+      voiceLines: [],
+      movements: [],
+    },
+  };
+}
+
+app.get('/robotConfig', async (req, res) => {
+  const mac = typeof req.query.mac === 'string' ? req.query.mac : '';
+  if (!mac) {
+    return res.status(400).json({ ok: false, error: 'missing_mac' });
+  }
+
+  try {
+    const url = new URL(ROBOT_CONFIG_URL);
+    url.searchParams.set('mac', mac);
+    const upstream = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    const text = await upstream.text();
+
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      console.log(`[${now()}] robotConfig GET mac=${mac} -> invalid upstream JSON`);
+      return res.status(502).json({ ok: false, error: 'server_error' });
+    }
+
+    if (!upstream.ok) {
+      const status = payload?.error === 'not_found' ? 404 : upstream.status;
+      console.log(`[${now()}] robotConfig GET mac=${mac} -> upstream error ${upstream.status}`);
+      return res.status(status).json(payload);
+    }
+
+    const config = payload?.config || {};
+    const normalized = {
+      ok: payload?.ok !== false,
+      config: {
+        configVersion: Number.isInteger(config.configVersion) ? config.configVersion : 0,
+        updatedAt: typeof config.updatedAt === 'string' ? config.updatedAt : null,
+        kidName: typeof config.kidName === 'string' ? config.kidName : null,
+        voiceLines: Array.isArray(config.voiceLines) ? config.voiceLines : [],
+        movements: Array.isArray(config.movements) ? config.movements : [],
+      },
+    };
+
+    console.log(`[${now()}] robotConfig GET mac=${mac} -> version=${normalized.config.configVersion}`);
+    return res.json(normalized);
+  } catch (error) {
+    console.log(`[${now()}] robotConfig GET mac=${mac} -> proxy failure: ${error.message}`);
+    return res.status(502).json(defaultRobotConfig());
+  }
+});
 
 app.get('/ota/', (req, res) => {
   const payload = otaPayload(req);

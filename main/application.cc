@@ -284,9 +284,68 @@ void Application::HandleNetworkConnectedEvent() {
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
     }
 
+    if (robot_config_task_handle_ == nullptr) {
+        xTaskCreate([](void* arg) {
+            Application* app = static_cast<Application*>(arg);
+            app->SyncRobotConfig();
+            app->robot_config_task_handle_ = nullptr;
+            vTaskDelete(NULL);
+        }, "robot_config", 4096 * 2, this, 2, &robot_config_task_handle_);
+    } else {
+        ESP_LOGW(TAG, "Robot config task already running");
+    }
+
     // Update the status bar immediately to show the network state
     auto display = Board::GetInstance().GetDisplay();
     display->UpdateStatusBar(true);
+}
+
+void Application::SyncRobotConfig() {
+    // Give boot/connect audio a moment to finish before config sync starts.
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    constexpr TickType_t kRobotConfigPollInterval = pdMS_TO_TICKS(30000);
+
+    while (Board::GetInstance().GetNetwork() != nullptr) {
+        RobotConfigData config;
+        bool changed = false;
+        if (!RobotConfig::FetchAndStore(&config, &changed)) {
+            ESP_LOGW(TAG, "Robot config sync failed");
+        } else {
+            if (config.config_version != last_robot_config_version_ || config.updated_at != last_robot_config_updated_at_) {
+                changed = true;
+            }
+            last_robot_config_version_ = config.config_version;
+            last_robot_config_updated_at_ = config.updated_at;
+
+            if (config.kid_name.empty()) {
+                ESP_LOGI(TAG, "Robot config synced but kid name is empty");
+            } else {
+                auto message = std::string("Hi, ") + config.kid_name + "!";
+                auto first_voice_line = config.voice_lines.empty() ? std::string() : config.voice_lines.front().text;
+                auto first_movement = config.movements.empty() ? std::string() : config.movements.front().name;
+                Schedule([this, message = std::move(message), first_voice_line = std::move(first_voice_line), first_movement = std::move(first_movement), changed]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    std::string summary = message;
+                    if (!first_voice_line.empty()) {
+                        summary += " • line: " + first_voice_line;
+                    }
+                    if (!first_movement.empty()) {
+                        summary += " • move: " + first_movement;
+                    }
+                    display->ShowNotification(summary.c_str(), 30000);
+                    if (changed) {
+                        Alert(Lang::Strings::INFO, summary.c_str(), "sparkles", Lang::Sounds::OGG_SUCCESS);
+                    }
+                });
+            }
+        }
+
+        if (Board::GetInstance().GetNetwork() == nullptr) {
+            break;
+        }
+        vTaskDelay(kRobotConfigPollInterval);
+    }
 }
 
 void Application::HandleNetworkDisconnectedEvent() {

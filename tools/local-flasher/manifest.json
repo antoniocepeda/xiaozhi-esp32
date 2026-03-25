@@ -1,0 +1,32 @@
+{
+  "name": "Robot Dog Firmware",
+  "version": "local-build",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        {
+          "path": "../../build/bootloader/bootloader.bin",
+          "offset": 0
+        },
+        {
+          "path": "../../build/partition_table/partition-table.bin",
+          "offset": 32768
+        },
+        {
+          "path": "../../build/ota_data_initial.bin",
+          "offset": 53248
+        },
+        {
+          "path": "../../build/xiaozhi.bin",
+          "offset": 65536
+        },
+        {
+          "path": "../../build/generated_assets.bin",
+          "offset": 3006464
+        }
+      ]
+    }
+  ]
+}
